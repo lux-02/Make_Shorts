@@ -27,8 +27,8 @@ TARGET_SIZE = (1080, 1920) # 숏츠 해상도
 FONT_SIZE = 65
 MAX_LINE_CHARS = 20 # 한 줄 최대 글자수(단어 단위 표시)
 TRANSITION_DURATION = 0.0 # 하드 컷 (속도 맞춤이라 끊김 없이 연결됨)
-MIN_SPEED = 0.8  # 너무 느리면 부자연스러움
-MAX_SPEED = 1.3  # 너무 빠르면 부자연스러움
+MIN_SPEED = 0.6  # 최소 속도 (더 느리게 가능하도록 완화)
+MAX_SPEED = 1.5  # 최대 속도 (더 빠르게 가능하도록 완화)
 SUBTITLE_PAD = 0.0  # 자막 여유 시간 (겹침 방지)
 # ==========================================
 
@@ -85,21 +85,44 @@ def fit_video_to_audio(video_path, target_duration):
     # moviepy vfx.speedx 적용
     final_clip = clip.fx(vfx.speedx, speed_factor)
 
-    # 부족한 길이는 마지막 프레임으로 채움 (루프 방지)
+    # 부족한 길이는 영상 반복 또는 마지막 프레임으로 채움
     if final_clip.duration < target_duration:
         pad = target_duration - final_clip.duration
-        t_final = max(0.0, final_clip.duration - 0.03)
-        t_orig = max(0.0, clip.duration - 0.03)
-        try:
-            frame = final_clip.get_frame(t_final)
-        except Exception:
+        
+        # 1. 패딩이 원본 영상의 30% 이상이면 영상을 반복
+        if pad > original_duration * 0.3 and original_duration > 1.0:
+            print(f"   🔁 영상 반복: +{pad:.2f}초 추가 (원본 영상 루프)")
+            # 필요한 만큼 영상 반복
+            num_repeats = int(pad / final_clip.duration) + 1
+            repeat_clips = [final_clip] * min(num_repeats, 3)  # 최대 3회 반복
+            repeated = concatenate_videoclips(repeat_clips)
+            # 정확한 길이로 자르기
+            final_clip = repeated.subclip(0, target_duration)
+        else:
+            # 2. 패딩이 적으면 마지막 프레임 freeze
             try:
-                frame = clip.get_frame(t_orig)
+                # 중간 지점의 프레임 사용 (더 안정적)
+                t_mid = final_clip.duration / 2
+                frame = final_clip.get_frame(t_mid)
             except Exception:
-                # 최후의 수단: 검정 화면으로 패딩
-                frame = np.zeros((TARGET_SIZE[1], TARGET_SIZE[0], 3), dtype=np.uint8)
-        freeze_clip = ImageClip(frame).set_duration(pad)
-        final_clip = concatenate_videoclips([final_clip, freeze_clip])
+                try:
+                    # 시작 부분 프레임 사용
+                    frame = final_clip.get_frame(0.1)
+                except Exception:
+                    try:
+                        # 원본 클립의 중간 프레임 사용
+                        frame = clip.get_frame(clip.duration / 2)
+                    except Exception:
+                        # 최후의 수단: 원본의 첫 프레임
+                        try:
+                            frame = clip.get_frame(0)
+                        except Exception:
+                            # 정말 최후: 검정 화면 (이 경우는 거의 없음)
+                            print(f"   ⚠️ 경고: 프레임 추출 실패, 검은 화면 사용")
+                            frame = np.zeros((TARGET_SIZE[1], TARGET_SIZE[0], 3), dtype=np.uint8)
+            
+            freeze_clip = ImageClip(frame).set_duration(pad)
+            final_clip = concatenate_videoclips([final_clip, freeze_clip])
 
     # 미세한 오차 제거를 위해 duration 강제 고정
     final_clip = final_clip.set_duration(target_duration)
