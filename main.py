@@ -25,11 +25,21 @@ BGM_VOLUME = 0.15    # 배경음악 볼륨 (0.0 ~ 1.0, 낮을수록 작음)
 # 화면 및 자막 설정
 TARGET_SIZE = (1080, 1920) # 숏츠 해상도
 FONT_SIZE = 65
-MAX_LINE_CHARS = 20 # 한 줄 최대 글자수(단어 단위 표시)
+MAX_LINE_CHARS = 10 # 한 줄 최대 글자수(단어 단위 표시)
 TRANSITION_DURATION = 0.0 # 하드 컷 (속도 맞춤이라 끊김 없이 연결됨)
 MIN_SPEED = 0.6  # 최소 속도 (더 느리게 가능하도록 완화)
 MAX_SPEED = 1.5  # 최대 속도 (더 빠르게 가능하도록 완화)
 SUBTITLE_PAD = 0.0  # 자막 여유 시간 (겹침 방지)
+
+# 대본-Whisper 매칭(타임스탬프) 정렬 설정
+USE_DP_ALIGNMENT = True
+DP_USE_JAMO = True  # 한글 자모 분해 기반 유사도 계산 옵션
+DP_MIN_ASSIGN_SIM = 0.62  # DP 정렬 결과에서 실제 타임스탬프를 "할당"할 최소 유사도
+LINE_FALLBACK_MIN_CONF = 0.60  # 라인 매칭 confidence가 이 값 미만이면 segment 타이밍으로 폴백
+DP_INS_COST = 0.60  # Whisper 쪽에만 있는 단어(삽입) 비용
+DP_DEL_COST = 0.60  # Script 쪽에만 있는 단어(삭제) 비용
+DP_LOW_SIM_SUB_COST = 1.20  # 유사도가 낮을 때 치환 비용(INS+DEL과 비슷하게)
+TIMING_EPS = 1e-3
 # ==========================================
 
 def fit_video_to_audio(video_path, target_duration):
@@ -151,6 +161,141 @@ def normalize_word(word: str) -> str:
 def split_display_words(text: str) -> List[str]:
     return [w for w in re.split(r"\s+", text.strip()) if w]
 
+def hangul_to_jamo(s: str) -> str:
+    """
+    한글 음절을 초/중/종성 자모로 분해해 유사도(편집거리) 기반 매칭을 개선합니다.
+    예: '괴'와 '개'처럼 한 글자 차이를 좀 더 안정적으로 반영할 수 있습니다.
+    """
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if 0xAC00 <= code <= 0xD7A3:
+            s_index = code - 0xAC00
+            l = s_index // 588
+            v = (s_index % 588) // 28
+            t = s_index % 28
+
+            out.append(chr(0x1100 + l))  # choseong
+            out.append(chr(0x1161 + v))  # jungseong
+            if t:
+                out.append(chr(0x11A7 + t))  # jongseong
+        else:
+            out.append(ch)
+    return "".join(out)
+
+def levenshtein_distance(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+
+    # O(min(len(a),len(b))) memory DP
+    if len(a) < len(b):
+        a, b = b, a
+
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            ins = cur[j - 1] + 1
+            dele = prev[j] + 1
+            sub = prev[j - 1] + (0 if ca == cb else 1)
+            cur.append(min(ins, dele, sub))
+        prev = cur
+    return prev[-1]
+
+def token_similarity(a: str, b: str, use_jamo: bool = True) -> float:
+    ka = normalize_word(a)
+    kb = normalize_word(b)
+    if use_jamo:
+        ka = hangul_to_jamo(ka)
+        kb = hangul_to_jamo(kb)
+    if not ka or not kb:
+        return 0.0
+    if ka == kb:
+        return 1.0
+    max_len = max(len(ka), len(kb))
+    if max_len == 0:
+        return 0.0
+    dist = levenshtein_distance(ka, kb)
+    return max(0.0, min(1.0, 1.0 - (dist / max_len)))
+
+def dp_align_tokens(script_tokens: List[str], whisper_tokens: List[str], use_jamo: bool = True) -> List[Optional[int]]:
+    """
+    전체 시퀀스(대본 토큰열)와 Whisper 토큰열을 DP로 단조(monotonic) 정렬해,
+    각 script token이 매칭된 whisper index를 반환합니다(None 가능).
+    """
+    n = len(script_tokens)
+    m = len(whisper_tokens)
+    if n == 0 or m == 0:
+        return [None] * n
+
+    sim_cache: Dict[Tuple[str, str], float] = {}
+
+    def sim(i: int, j: int) -> float:
+        key = (script_tokens[i], whisper_tokens[j])
+        if key in sim_cache:
+            return sim_cache[key]
+        val = token_similarity(script_tokens[i], whisper_tokens[j], use_jamo=use_jamo)
+        sim_cache[key] = val
+        return val
+
+    def sub_cost(i: int, j: int) -> float:
+        s = sim(i, j)
+        if s >= 0.85:
+            return 0.0
+        if s >= 0.50:
+            return 1.0 - s
+        return DP_LOW_SIM_SUB_COST
+
+    # dp + backptr: 0=diag, 1=up(del), 2=left(ins)
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    bt = [[0] * (m + 1) for _ in range(n + 1)]
+
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] + DP_DEL_COST
+        bt[i][0] = 1
+    for j in range(1, m + 1):
+        dp[0][j] = dp[0][j - 1] + DP_INS_COST
+        bt[0][j] = 2
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            c_diag = dp[i - 1][j - 1] + sub_cost(i - 1, j - 1)
+            c_up = dp[i - 1][j] + DP_DEL_COST
+            c_left = dp[i][j - 1] + DP_INS_COST
+
+            best = c_diag
+            op = 0
+            if c_up < best:
+                best = c_up
+                op = 1
+            if c_left < best:
+                best = c_left
+                op = 2
+
+            dp[i][j] = best
+            bt[i][j] = op
+
+    mapping: List[Optional[int]] = [None] * n
+    i, j = n, m
+    while i > 0 or j > 0:
+        op = bt[i][j]
+        if op == 0 and i > 0 and j > 0:
+            s = sim(i - 1, j - 1)
+            if s >= DP_MIN_ASSIGN_SIM:
+                mapping[i - 1] = j - 1
+            i -= 1
+            j -= 1
+        elif op == 1 and i > 0:
+            i -= 1
+        else:
+            j -= 1
+
+    return mapping
+
 def extract_whisper_words(segments: List[Dict]) -> List[Dict]:
     words = []
     for seg in segments:
@@ -167,6 +312,79 @@ def extract_whisper_words(segments: List[Dict]) -> List[Dict]:
     return words
 
 def align_script_lines(script_lines: List[str], whisper_words: List[Dict]) -> List[Dict]:
+    # DP 기반 정렬: 전체 토큰열을 단조 정렬해 라인별로 매칭 결과를 분배합니다.
+    # (Whisper 단어 타임스탬프가 흔들려도 포인터 드리프트를 줄일 수 있음)
+    if USE_DP_ALIGNMENT and whisper_words:
+        per_line_display = [split_display_words(line) for line in script_lines]
+        script_flat = []
+        script_meta: List[Tuple[int, int]] = []
+        for li, words in enumerate(per_line_display):
+            for wi, w in enumerate(words):
+                if normalize_word(w):
+                    script_flat.append(w)
+                    script_meta.append((li, wi))
+
+        whisper_flat = [w["word"] for w in whisper_words]
+        mapping = dp_align_tokens(script_flat, whisper_flat, use_jamo=DP_USE_JAMO)
+
+        # 라인별 결과 구성
+        aligned: List[Dict] = []
+        for li, line in enumerate(script_lines):
+            display_words = per_line_display[li]
+            word_times: List[Optional[Tuple[float, float]]] = [None] * len(display_words)
+            matched_count = 0
+            sim_sum = 0.0
+            sim_cnt = 0
+            line_start = None
+            line_end = None
+
+            aligned.append({
+                "text": line,
+                "display_words": display_words,
+                "word_times": word_times,
+                "start": None,
+                "end": None,
+                "matched_words": 0,
+                "confidence": 0.0,
+                "avg_sim": 0.0
+            })
+
+        for k, (li, wi) in enumerate(script_meta):
+            widx = mapping[k]
+            if widx is None:
+                continue
+            ww = whisper_words[widx]
+            # 원본 display token vs whisper normalized token 기반으로 similarity 재계산(로깅/신뢰도용)
+            s = token_similarity(script_flat[k], ww["word"], use_jamo=DP_USE_JAMO)
+            if s < DP_MIN_ASSIGN_SIM:
+                continue
+            aligned[li]["word_times"][wi] = (ww["start"], ww["end"])
+            matched_count = aligned[li].get("matched_words", 0) + 1
+            aligned[li]["matched_words"] = matched_count
+            aligned[li]["avg_sim"] = float(aligned[li].get("avg_sim", 0.0)) + s
+            aligned[li]["confidence"] = float(aligned[li].get("confidence", 0.0)) + 1.0  # 임시로 카운트로 사용
+
+            if aligned[li]["start"] is None:
+                aligned[li]["start"] = ww["start"]
+            aligned[li]["end"] = ww["end"]
+
+        # confidence/avg_sim 정리
+        for li, info in enumerate(aligned):
+            total = sum(1 for w in info["display_words"] if normalize_word(w))
+            matched = info.get("matched_words", 0)
+            if total <= 0:
+                info["confidence"] = 0.0
+                info["avg_sim"] = 0.0
+            else:
+                info["confidence"] = matched / total
+                if matched > 0:
+                    info["avg_sim"] = info.get("avg_sim", 0.0) / matched
+                else:
+                    info["avg_sim"] = 0.0
+
+        return aligned
+
+    # 기존 방식(폴백)
     pointer = 0
     aligned = []
     
@@ -221,12 +439,25 @@ def align_script_lines(script_lines: List[str], whisper_words: List[Dict]) -> Li
             "word_times": word_times,
             "start": line_start,
             "end": line_end,
-            "matched_words": matched_count
+            "matched_words": matched_count,
+            "confidence": (matched_count / max(1, sum(1 for w in normalized_words if w))) if normalized_words else 0.0,
+            "avg_sim": 1.0 if matched_count else 0.0
         })
     
     return aligned
 
 def resolve_line_timings(aligned: List[Dict], segments: List[Dict], audio_duration: float) -> List[Dict]:
+    # 0) confidence가 낮으면 word 타임스탬프를 버리고 segment 기반으로 폴백
+    for i, info in enumerate(aligned):
+        conf = float(info.get("confidence", 0.0) or 0.0)
+        if conf < LINE_FALLBACK_MIN_CONF and i < len(segments):
+            info["start"] = segments[i]["start"]
+            info["end"] = segments[i]["end"]
+            # 낮은 confidence에서는 word 기반 타이밍을 사용하지 않도록 None 처리(균등 보간으로 전환)
+            if "word_times" in info and info["word_times"]:
+                info["word_times"] = [None] * len(info["word_times"])
+            info["matched_words"] = 0
+
     # word 기반 타이밍이 있으면 절대 덮어쓰지 않음!
     # 없는 경우에만 보완
     for i, info in enumerate(aligned):
@@ -245,13 +476,21 @@ def resolve_line_timings(aligned: List[Dict], segments: List[Dict], audio_durati
                     info["end"] = min(audio_duration, (i + 1) * per)
 
     # 시간 검증 및 최소한의 보정만 수행
+    prev_start = 0.0
     for i, info in enumerate(aligned):
-        start = info["start"]
-        end = info["end"]
-        
+        start = float(info["start"])
+        end = float(info["end"])
+
+        # 범위 클램프 + 단조 증가(역행 방지)
+        start = max(0.0, min(audio_duration, start))
+        end = max(0.0, min(audio_duration, end))
+        if start < prev_start:
+            start = prev_start
+        prev_start = start
+
         # 음수 duration 방지
-        if end <= start:
-            end = start + 0.5
+        if end <= start + TIMING_EPS:
+            end = min(audio_duration, start + 0.5)
         
         info["start"], info["end"] = start, end
 
@@ -265,10 +504,15 @@ def resolve_line_timings(aligned: List[Dict], segments: List[Dict], audio_durati
             gap = (next_start + current_end) / 2
             aligned[i]["end"] = gap - 0.1
             aligned[i + 1]["start"] = gap + 0.1
+            # 역행/음수 방지
+            if aligned[i]["end"] <= aligned[i]["start"] + TIMING_EPS:
+                aligned[i]["end"] = min(audio_duration, aligned[i]["start"] + 0.5)
+            if aligned[i + 1]["end"] <= aligned[i + 1]["start"] + TIMING_EPS:
+                aligned[i + 1]["end"] = min(audio_duration, aligned[i + 1]["start"] + 0.5)
 
     # 마지막 라인은 오디오 끝까지
     if aligned:
-        aligned[-1]["end"] = max(aligned[-1]["end"], audio_duration)
+        aligned[-1]["end"] = audio_duration
     
     return aligned
 
@@ -380,8 +624,8 @@ def chunk_words_with_times(info: Dict, max_chars: int) -> List[Dict]:
         chunk_end = max(t[1] for t in times)
         
         # 라인 범위 내로 제한
-        chunk_start = max(line_start, chunk_start)
-        chunk_end = min(line_end, chunk_end)
+        chunk_start = max(line_start, min(line_end, chunk_start))
+        chunk_end = max(line_start, min(line_end, chunk_end))
         
         # 최소 duration 보장 (0.3초)
         min_duration = 0.3
@@ -395,12 +639,25 @@ def chunk_words_with_times(info: Dict, max_chars: int) -> List[Dict]:
             if chunk_end - chunk_start < min_duration:
                 chunk_end = min(line_end, chunk_start + min_duration)
 
+        # 최종 안전장치(역행/음수 방지)
+        if chunk_end < chunk_start:
+            chunk_end = chunk_start
+
         out.append({
             "text": chunk_text,
             "start": chunk_start,
             "end": chunk_end
         })
     
+    # Chunk start/end 단조 증가(역행 방지)
+    prev = line_start
+    for c in out:
+        if c["start"] < prev + TIMING_EPS:
+            c["start"] = min(line_end, prev + TIMING_EPS)
+        if c["end"] < c["start"]:
+            c["end"] = c["start"]
+        prev = c["start"]
+
     # 4. Chunk 간 간격 완전 제거 (깜빡거림 제거)
     for i in range(len(out) - 1):
         current_chunk = out[i]
@@ -414,6 +671,10 @@ def chunk_words_with_times(info: Dict, max_chars: int) -> List[Dict]:
         elif gap < -0.01:
             # 겹치면 현재 chunk를 다음 chunk 시작 직전까지로 조정
             out[i]["end"] = next_chunk["start"]
+
+        # 안전장치: end가 start보다 작아지지 않도록
+        if out[i]["end"] < out[i]["start"]:
+            out[i]["end"] = out[i]["start"]
     
     return out
 
@@ -617,7 +878,9 @@ if __name__ == "__main__":
             end_str = "N/A"
         matched = info.get("matched_words", 0)
         total = len(info["word_times"])
-        print(f"   [{i+1}] {duration:.2f}초 ({start_str} ~ {end_str}): {info['text'][:40]}... [매칭: {matched}/{total}]")
+        conf = float(info.get("confidence", 0.0) or 0.0)
+        avg_sim = float(info.get("avg_sim", 0.0) or 0.0)
+        print(f"   [{i+1}] {duration:.2f}초 ({start_str} ~ {end_str}): {info['text'][:40]}... [매칭: {matched}/{total}, conf:{conf:.2f}, sim:{avg_sim:.2f}]")
     
     # 전체 비디오 클립 생성 - 다음 라인 시작 직전까지 연장 (자막과 동일한 로직)
     print("\n🎬 영상 클립 타이밍 조정:")
@@ -697,6 +960,17 @@ if __name__ == "__main__":
                 "end": chunk["end"],
                 "line_idx": i
             })
+
+    # Chunk 타임라인 안전장치: start/end를 오디오 범위로 클램프하고 단조 증가(역행) 방지
+    prev_start = 0.0
+    for c in all_chunk_infos:
+        c["start"] = float(max(0.0, min(audio_duration, c["start"])))
+        c["end"] = float(max(0.0, min(audio_duration, c["end"])))
+        if c["start"] < prev_start + TIMING_EPS:
+            c["start"] = min(audio_duration, prev_start + TIMING_EPS)
+        if c["end"] < c["start"]:
+            c["end"] = c["start"]
+        prev_start = c["start"]
     
     # 2단계: 각 chunk의 end 시간을 다음 chunk 시작 직전까지 연장 (간격 0초)
     for i in range(len(all_chunk_infos)):
@@ -719,6 +993,10 @@ if __name__ == "__main__":
                 chunk["end"] = min(chunk["start"] + min_duration, max_end)
             else:
                 chunk["end"] = min(chunk["start"] + min_duration, audio_duration)
+
+        # 최종 안전장치
+        chunk["start"] = max(0.0, min(audio_duration, chunk["start"]))
+        chunk["end"] = max(chunk["start"], min(audio_duration, chunk["end"]))
     
     # 3단계: 자막 생성 및 출력
     all_subtitles = []
