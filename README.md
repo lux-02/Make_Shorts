@@ -11,11 +11,15 @@ TTS 음성과 대본을 기반으로 자막이 자동으로 싱크되는 쇼츠 
 - 🎯 **깜빡임 없는 전환**: 자막과 영상이 끊김 없이 연속
 - 🧠 **대본-Whisper 매칭 안정화**: DP(시퀀스 정렬) + 편집거리/자모 유사도 + 라인 confidence 기반 폴백
 - 🛡️ **자막 타임라인 안전장치**: chunk 타이밍 역행/음수 duration 방지 (클램프/단조 보정)
+- 🔧 **폴백 오동작 완화**: 저신뢰 라인이라도 경계(start/end)가 정상이고 겹침이 없으면 word 타이밍 유지
+- 🔀 **라인 겹침 보정 개선**: 이전 라인 end를 보존하고 다음 라인 start만 뒤로 이동해 경계 왜곡 최소화
 
 ## 📦 설치
 
+권장 파이썬 버전: `3.12`
+
 ```bash
-pip install whisper moviepy numpy
+pip install "moviepy<2" openai-whisper numpy streamlit Pillow
 ```
 
 ## 📁 폴더 구조
@@ -24,7 +28,11 @@ pip install whisper moviepy numpy
 gen-vd/
 ├── main.py           # 메인 스크립트
 ├── download.wav      # TTS 오디오 파일 (기본값)
-├── bg.mp3            # 배경음악 파일 (선택사항)
+├── bg/               # 배경음악 폴더 (선택사항, 실행 시 랜덤 1곡 선택)
+│   ├── track1.mp3
+│   ├── track2.wav
+│   └── ...
+├── bg.mp3            # 기존 단일 배경음악 파일 (폴백, 선택사항)
 └── vd/               # 비디오 파일 폴더
     ├── 1.mp4
     ├── 2.mp4
@@ -49,18 +57,31 @@ TTS로 생성한 오디오 파일을 `download.wav`로 저장하거나,
 
 ### 2-1. 배경음악 추가 (선택사항)
 
-`bg.mp3` 파일을 추가하면 TTS와 함께 배경음악이 재생됩니다:
+`bg` 폴더에 배경음악 파일을 넣으면 실행 시 랜덤 1곡이 선택되어 TTS와 함께 재생됩니다:
 
 - 파일 형식: .mp3, .wav, .m4a 등
 - 자동으로 영상 길이에 맞춰 루프 재생
 - 볼륨 조절 가능 (기본값: 15%)
 - BGM이 짧으면 자동으로 반복 재생
+- `bg` 폴더가 비어 있으면 `bg.mp3`를 폴백으로 사용
 
 ### 3. 스크립트 실행
 
 ```bash
 python3 main.py
 ```
+
+### 3-1. Streamlit GUI 실행 (선택)
+
+CLI 대신 GUI로 실행하려면:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+- 오디오 파일: `오디오 선택` 버튼으로 파일 선택 가능
+- 비디오 폴더: `폴더 선택` 버튼으로 폴더 선택 가능
+- 선택기가 동작하지 않는 환경에서는 경로를 직접 입력
 
 ### 4. 대본 입력
 
@@ -110,7 +131,8 @@ FONT_SIZE = 65              # 자막 크기
 MAX_LINE_CHARS = 10         # 자막 한 줄 최대 글자 수
 MIN_SPEED = 0.6             # 최소 재생 속도
 MAX_SPEED = 1.5             # 최대 재생 속도
-BGM_PATH = "bg.mp3"         # 배경음악 파일 경로
+BGM_FOLDER = "bg"           # 배경음악 폴더 경로 (랜덤 선택)
+BGM_LEGACY_PATH = "bg.mp3"  # 기존 단일 파일 폴백 경로
 BGM_VOLUME = 0.15           # 배경음악 볼륨 (0.0 ~ 1.0)
 
 # 대본-Whisper 매칭(타임스탬프) 정렬 설정
@@ -125,7 +147,7 @@ LINE_FALLBACK_MIN_CONF = 0.60   # 라인 매칭 confidence가 낮으면 Whisper 
 1. **음성 분석**: Whisper로 TTS 음성 분석 및 단어별 타임스탬프 추출
 2. **자막/라인 매칭**: DP(시퀀스 정렬)로 대본 토큰열과 Whisper 단어열을 단조 정렬
 3. **유사도 계산**: 편집거리(Levenshtein) + (옵션) 한글 자모 분해 기반 similarity로 오타/발음 차이를 흡수
-4. **폴백**: 라인별 confidence가 낮으면 word 타임스탬프 대신 Whisper segment start/end를 사용
+4. **폴백**: 라인별 confidence가 낮고(또는 매칭 0/경계 누락/이전 라인 겹침) 실패 징후가 있을 때만 Whisper segment start/end를 사용
 5. **자연스러운 분할**: TTS pause(0.2초 이상)를 기준으로 자막 분할
 6. **타이밍 조정**: 자막/영상 간격을 0으로 만들어 깜빡임 제거
 7. **영상 편집**: 각 라인별 영상 매핑 및 속도 자동 조절
@@ -148,6 +170,7 @@ TTS 생성 시 문장 간 pause를 더 명확하게 설정하세요
 ### 대본-Whisper 매칭이 어긋나는 경우
 
 - 실행 로그의 라인별 출력에 `conf:0.xx, sim:0.xx`가 표시됩니다.
+- 특정 라인이 `conf`가 낮아도 `matched_words>0`이고 경계가 정상이며 이전 라인과 겹치지 않으면 word 타임스탬프를 유지합니다.
 - 특정 라인이 `conf`가 낮아 폴백되는 경우 `LINE_FALLBACK_MIN_CONF`를 낮추면 word 타임스탬프를 더 많이 쓰게 됩니다(공격적).
 - 반대로 `LINE_FALLBACK_MIN_CONF`를 높이면 segment 폴백을 더 자주 써서 안정성을 우선합니다(보수적).
 - 발음/오타/띄어쓰기 이슈가 많으면 `DP_USE_JAMO=True`가 유리합니다.
@@ -164,7 +187,7 @@ TTS 생성 시 문장 간 pause를 더 명확하게 설정하세요
 ### BGM을 사용하지 않으려면
 
 - 실행 시 BGM 추가 여부에서 `n` 입력
-- 또는 `bg.mp3` 파일을 삭제/이름 변경
+- 또는 `bg` 폴더를 비우고 `bg.mp3` 파일을 삭제/이름 변경
 
 ## 🐛 문제 해결
 

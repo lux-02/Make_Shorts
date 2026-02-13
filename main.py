@@ -2,8 +2,15 @@ import whisper
 import sys
 import os
 import re
-from typing import List, Dict, Tuple, Optional
+import random
+from typing import List, Dict, Tuple, Optional, Callable, Any
 import numpy as np
+from PIL import Image
+
+# Pillow 10+ 호환: moviepy(<2) 내부에서 참조하는 ANTIALIAS 상수 보정
+if not hasattr(Image, "ANTIALIAS") and hasattr(Image, "Resampling"):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
+
 from moviepy.editor import (VideoFileClip, AudioFileClip, TextClip, ImageClip,
                             CompositeVideoClip, CompositeAudioClip, concatenate_videoclips,
                             ColorClip)
@@ -19,7 +26,9 @@ FONT_PATH = "/Users/lux/Library/Fonts/SUIT-Bold.otf"
 # 파일 설정
 DEFAULT_AUDIO_PATH = "download.wav"
 VIDEO_FOLDER = "vd"  # 비디오 파일이 있는 폴더
-BGM_PATH = "bg.mp3"  # 배경음악 파일 (선택사항)
+BGM_FOLDER = "bg"  # 배경음악 폴더 (선택사항, 내부 파일 랜덤 선택)
+BGM_LEGACY_PATH = "bg.mp3"  # 기존 단일 배경음악 파일 경로 (폴백)
+BGM_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
 BGM_VOLUME = 0.15    # 배경음악 볼륨 (0.0 ~ 1.0, 낮을수록 작음)
 
 # 화면 및 자막 설정
@@ -30,6 +39,7 @@ TRANSITION_DURATION = 0.0 # 하드 컷 (속도 맞춤이라 끊김 없이 연결
 MIN_SPEED = 0.6  # 최소 속도 (더 느리게 가능하도록 완화)
 MAX_SPEED = 1.5  # 최대 속도 (더 빠르게 가능하도록 완화)
 SUBTITLE_PAD = 0.0  # 자막 여유 시간 (겹침 방지)
+FORCE_FIRST_SUBTITLE_START = 0.0  # 첫 자막 시작 시각 강제(초)
 
 # 대본-Whisper 매칭(타임스탬프) 정렬 설정
 USE_DP_ALIGNMENT = True
@@ -41,6 +51,27 @@ DP_DEL_COST = 0.60  # Script 쪽에만 있는 단어(삭제) 비용
 DP_LOW_SIM_SUB_COST = 1.20  # 유사도가 낮을 때 치환 비용(INS+DEL과 비슷하게)
 TIMING_EPS = 1e-3
 # ==========================================
+
+def pick_random_bgm_path(folder_path: str, extensions: Tuple[str, ...], legacy_path: Optional[str] = None) -> Optional[str]:
+    """
+    배경음악 파일 경로를 결정한다.
+    1) folder_path 내부 파일 중 확장자가 맞는 파일을 랜덤 선택
+    2) 없으면 legacy_path 단일 파일을 폴백으로 사용
+    """
+    if folder_path and os.path.isdir(folder_path):
+        candidates = []
+        for name in os.listdir(folder_path):
+            full_path = os.path.join(folder_path, name)
+            if os.path.isfile(full_path) and name.lower().endswith(extensions):
+                candidates.append(full_path)
+
+        if candidates:
+            return random.choice(candidates)
+
+    if legacy_path and os.path.isfile(legacy_path):
+        return legacy_path
+
+    return None
 
 def fit_video_to_audio(video_path, target_duration):
     """
@@ -448,11 +479,47 @@ def align_script_lines(script_lines: List[str], whisper_words: List[Dict]) -> Li
 
 def resolve_line_timings(aligned: List[Dict], segments: List[Dict], audio_duration: float) -> List[Dict]:
     # 0) confidence가 낮으면 word 타임스탬프를 버리고 segment 기반으로 폴백
+    def pick_fallback_segment_idx(line_idx: int, prev_end: Optional[float]) -> int:
+        if not segments:
+            return 0
+
+        base_idx = min(line_idx, len(segments) - 1)
+        if prev_end is None:
+            return base_idx
+
+        # 이전 라인 끝 이후에서 시작하는 segment를 우선 사용해
+        # 저신뢰 라인이 이전 라인의 segment로 끌려가는 현상을 줄인다.
+        tolerance = 0.05
+        for seg_idx, seg in enumerate(segments):
+            seg_start = float(seg.get("start", 0.0))
+            if seg_start >= prev_end - tolerance:
+                return max(base_idx, seg_idx)
+        return base_idx
+
     for i, info in enumerate(aligned):
         conf = float(info.get("confidence", 0.0) or 0.0)
-        if conf < LINE_FALLBACK_MIN_CONF and i < len(segments):
-            info["start"] = segments[i]["start"]
-            info["end"] = segments[i]["end"]
+        matched_words = int(info.get("matched_words", 0) or 0)
+        cur_start = info.get("start")
+        cur_end = info.get("end")
+        has_missing_bounds = (cur_start is None or cur_end is None)
+        has_prev_overlap = False
+        if i > 0 and cur_start is not None and aligned[i - 1].get("end") is not None:
+            has_prev_overlap = float(cur_start) < float(aligned[i - 1]["end"]) - 0.05
+
+        # 저신뢰라도 일부 단어가 안정적으로 맞고(특히 line 시작/끝 경계가 정상) 겹침이 없으면
+        # word 기반 타이밍을 유지한다. 그렇지 않으면 segment 폴백.
+        should_fallback = conf < LINE_FALLBACK_MIN_CONF and (
+            matched_words == 0 or has_missing_bounds or has_prev_overlap
+        )
+
+        if should_fallback and segments:
+            prev_end = None
+            if i > 0 and aligned[i - 1].get("end") is not None:
+                prev_end = float(aligned[i - 1]["end"])
+
+            seg_idx = pick_fallback_segment_idx(i, prev_end)
+            info["start"] = segments[seg_idx]["start"]
+            info["end"] = segments[seg_idx]["end"]
             # 낮은 confidence에서는 word 기반 타이밍을 사용하지 않도록 None 처리(균등 보간으로 전환)
             if "word_times" in info and info["word_times"]:
                 info["word_times"] = [None] * len(info["word_times"])
@@ -494,19 +561,14 @@ def resolve_line_timings(aligned: List[Dict], segments: List[Dict], audio_durati
         
         info["start"], info["end"] = start, end
 
-    # 라인 간 간격 추가 (자연스러운 휴식)
+    # 라인 간 겹침 해소: 이전 라인의 끝은 유지하고 다음 라인 시작만 뒤로 이동
+    # (중간 분할 시 원래 맞던 라인까지 당겨지는 문제를 방지)
     for i in range(len(aligned) - 1):
-        current_end = aligned[i]["end"]
-        next_start = aligned[i + 1]["start"]
-        
-        # 간격이 너무 작으면 최소 간격 확보
-        if next_start - current_end < 0.2:
-            gap = (next_start + current_end) / 2
-            aligned[i]["end"] = gap - 0.1
-            aligned[i + 1]["start"] = gap + 0.1
-            # 역행/음수 방지
-            if aligned[i]["end"] <= aligned[i]["start"] + TIMING_EPS:
-                aligned[i]["end"] = min(audio_duration, aligned[i]["start"] + 0.5)
+        current_end = float(aligned[i]["end"])
+        next_start = float(aligned[i + 1]["start"])
+
+        if next_start < current_end - TIMING_EPS:
+            aligned[i + 1]["start"] = min(audio_duration, current_end + 0.2)
             if aligned[i + 1]["end"] <= aligned[i + 1]["start"] + TIMING_EPS:
                 aligned[i + 1]["end"] = min(audio_duration, aligned[i + 1]["start"] + 0.5)
 
@@ -552,6 +614,17 @@ def chunk_words_with_times(info: Dict, max_chars: int) -> List[Dict]:
                 # 다음 매칭 단어가 없으면 라인 끝까지
                 remaining = end_idx - start_idx
                 next_time = prev_time + remaining * (duration / total_words)
+
+            # 선두 미매칭 구간인데 next_time이 line_start와 같으면 gap=0으로 압축될 수 있음.
+            # 이 경우 평균 단어 길이로 앞쪽 시간을 역추정해 첫 자막이 너무 짧아지는 현상을 완화.
+            if (
+                start_idx == 0
+                and end_idx < len(interpolated_times)
+                and interpolated_times[end_idx] is not None
+            ):
+                est_word_dur = duration / total_words
+                est_prev = next_time - (end_idx - start_idx) * est_word_dur
+                prev_time = max(0.0, min(prev_time, est_prev))
             
             # 균등 분배
             gap = next_time - prev_time
@@ -675,6 +748,33 @@ def chunk_words_with_times(info: Dict, max_chars: int) -> List[Dict]:
         # 안전장치: end가 start보다 작아지지 않도록
         if out[i]["end"] < out[i]["start"]:
             out[i]["end"] = out[i]["start"]
+
+    # 5. 너무 짧은 chunk는 인접 chunk와 병합해 가독성 확보
+    # (특히 첫/마지막 chunk가 0.3~0.4초로 짧게 깜빡이는 문제 완화)
+    merge_threshold = 0.55
+    i = 0
+    while i < len(out):
+        dur = out[i]["end"] - out[i]["start"]
+        if dur >= merge_threshold or len(out) == 1:
+            i += 1
+            continue
+
+        # 우선 다음 chunk와 병합 (앞에서부터 읽는 흐름 유지)
+        if i < len(out) - 1:
+            out[i]["text"] = f"{out[i]['text']} {out[i + 1]['text']}".strip()
+            out[i]["end"] = out[i + 1]["end"]
+            del out[i + 1]
+            continue
+
+        # 마지막 짧은 chunk는 이전 chunk로 흡수
+        if i > 0:
+            out[i - 1]["text"] = f"{out[i - 1]['text']} {out[i]['text']}".strip()
+            out[i - 1]["end"] = out[i]["end"]
+            del out[i]
+            i -= 1
+            continue
+
+        i += 1
     
     return out
 
@@ -741,6 +841,348 @@ def input_multiline_script():
     
     return lines
 
+def generate_shorts(
+    audio_path: str,
+    user_script: List[str],
+    video_folder: str = VIDEO_FOLDER,
+    selected_bgm_path: Optional[str] = None,
+    bgm_volume: float = BGM_VOLUME,
+    output_path: str = "final_shorts_autofit.mp4",
+    whisper_model_name: str = "base",
+    bgm_folder: str = BGM_FOLDER,
+    bgm_legacy_path: str = BGM_LEGACY_PATH,
+    auto_pick_bgm: bool = True,
+    log_fn: Optional[Callable[[str], None]] = print,
+    moviepy_logger: Any = "bar",
+) -> Dict[str, Any]:
+    """현재 CLI 플로우와 동일한 영상 생성 파이프라인."""
+    if log_fn is None:
+        def log_fn(_: str) -> None:
+            return
+
+    def log(msg: str) -> None:
+        log_fn(str(msg))
+
+    script_lines = [line.strip() for line in user_script if line and line.strip()]
+    if not script_lines:
+        raise ValueError("대본이 비어 있습니다.")
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"오디오 파일을 찾을 수 없습니다: {audio_path}")
+
+    video_files = load_video_files(video_folder)
+    if not video_files:
+        raise FileNotFoundError(
+            f"비디오 파일을 찾을 수 없습니다: {video_folder} "
+            "(예: 1.mp4, 2.mp4 ...)"
+        )
+
+    if auto_pick_bgm and not selected_bgm_path:
+        selected_bgm_path = pick_random_bgm_path(bgm_folder, BGM_EXTENSIONS, bgm_legacy_path)
+    if selected_bgm_path and not os.path.exists(selected_bgm_path):
+        log(f"⚠️ 지정한 BGM 파일이 없어 무시합니다: {selected_bgm_path}")
+        selected_bgm_path = None
+
+    bgm_volume = float(max(0.0, min(1.0, bgm_volume)))
+
+    log("\n🎬 영상 생성 시작...")
+    log("\n📋 설정 요약:")
+    log(f"   🎵 오디오: {audio_path}")
+    if selected_bgm_path:
+        log(f"   🎶 배경음악: {selected_bgm_path} (볼륨: {bgm_volume * 100:.0f}%)")
+    else:
+        log("   🎶 배경음악: 없음")
+    log(f"   📝 대본: {len(script_lines)}줄")
+    log(f"   🎬 영상: {len(video_files)}개")
+
+    # 1. Whisper로 오디오 분석 (시간 정보 획득)
+    # User Script가 있으므로, Whisper는 '시간(Timestamp)' 추출용으로만 사용합니다.
+    model = whisper.load_model(whisper_model_name)
+    try:
+        result = model.transcribe(audio_path, language='ko', word_timestamps=True)
+    except TypeError:
+        result = model.transcribe(audio_path, language='ko')
+    segments = result['segments']
+    whisper_words = extract_whisper_words(segments)
+
+    final_clips = []
+    original_audio = AudioFileClip(audio_path)
+    audio_duration = original_audio.duration
+
+    log(f"\n📊 분석 결과:")
+    log(f"   📋 대본 라인 수: {len(script_lines)}")
+    log(f"   🎙 Whisper 인식 문장 수: {len(segments)}")
+    log(f"   🔤 Whisper 단어 수: {len(whisper_words)}")
+    log(f"   🎬 영상 파일 수: {len(video_files)}")
+
+    if len(whisper_words) == 0:
+        log("⚠️ Whisper에서 단어 타임스탬프를 추출하지 못했습니다. 문장 단위 타이밍을 사용합니다.")
+    else:
+        log("\n🔍 Whisper 세그먼트 상세:")
+        for i, seg in enumerate(segments):
+            log(f"   [{i+1}] {seg['start']:.2f}~{seg['end']:.2f}s: {seg['text']}")
+
+    loop_count = len(script_lines)
+    aligned = align_script_lines(script_lines, whisper_words)
+    aligned = resolve_line_timings(aligned, segments, audio_duration)
+
+    # 디버그: 타이밍 확인
+    log("\n⏰ 라인별 타이밍 정보 (word 매칭 후):")
+    for i, info in enumerate(aligned):
+        if info["start"] is not None and info["end"] is not None:
+            duration = info["end"] - info["start"]
+            start_str = f"{info['start']:.2f}"
+            end_str = f"{info['end']:.2f}"
+        else:
+            duration = 0
+            start_str = "N/A"
+            end_str = "N/A"
+        matched = info.get("matched_words", 0)
+        total = len(info["word_times"])
+        conf = float(info.get("confidence", 0.0) or 0.0)
+        avg_sim = float(info.get("avg_sim", 0.0) or 0.0)
+        log(
+            f"   [{i+1}] {duration:.2f}초 ({start_str} ~ {end_str}): "
+            f"{info['text'][:40]}... [매칭: {matched}/{total}, conf:{conf:.2f}, sim:{avg_sim:.2f}]"
+        )
+
+    # 전체 비디오 클립 생성 - 다음 라인 시작 직전까지 연장 (자막과 동일한 로직)
+    log("\n🎬 영상 클립 타이밍 조정:")
+
+    # 1단계: 각 라인의 실제 영상 duration 계산 (다음 라인 시작 직전까지)
+    video_durations = []
+    for i in range(loop_count):
+        # 영상 타임라인은 0초부터 시작해야 오디오/자막 대비 씬이 빨라지지 않음
+        start_t = 0.0 if i == 0 else aligned[i]["start"]
+
+        if i < loop_count - 1:
+            # 다음 라인 시작 직전까지 (간격 없음)
+            next_start = aligned[i + 1]["start"]
+            end_t = next_start
+        else:
+            # 마지막 라인은 오디오 끝까지
+            end_t = audio_duration
+
+        duration = max(0.05, end_t - start_t)
+        video_durations.append({
+            "index": i,
+            "start": start_t,
+            "end": end_t,
+            "duration": duration,
+            "original_end": aligned[i]["end"]
+        })
+
+        gap_info = ""
+        if i < loop_count - 1:
+            gap = aligned[i + 1]["start"] - aligned[i]["end"]
+            if gap > 0.1:
+                gap_info = f" (+{gap:.2f}초 연장)"
+
+        log(f"   라인 [{i+1}]: {start_t:.2f}s ~ {end_t:.2f}s = {duration:.2f}초{gap_info}")
+
+    # 2단계: 영상 클립 생성
+    for i in range(loop_count):
+        line_info = aligned[i]
+        text_line = line_info["text"]
+        vd = video_durations[i]
+        start_t = vd["start"]
+        end_t = vd["end"]
+        duration = vd["duration"]
+
+        # 영상 파일 1:1 매핑 (라인 1 -> 1.mp4, 라인 2 -> 2.mp4, ...)
+        if i < len(video_files):
+            video_path = video_files[i]
+        else:
+            # 영상이 부족한 경우 마지막 영상 재사용
+            video_path = video_files[-1]
+            log(f"   ⚠️ [{i+1}번 라인] 영상이 부족하여 {video_files[-1]}을(를) 재사용합니다.")
+
+        log(f"\n[{i+1}/{loop_count}] Scene 생성 중...")
+        log(f"   📝 대사: {text_line}")
+        log(f"   ⏱ 영상 시간: {duration:.2f}초 ({start_t:.2f} ~ {end_t:.2f})")
+        tts_start = float(line_info["start"])
+        tts_end = float(vd["original_end"])
+        tts_duration = max(0.0, tts_end - tts_start)
+        log(f"   🎙 TTS 시간: {tts_duration:.2f}초 ({tts_start:.2f} ~ {tts_end:.2f})")
+        log(f"   📼 영상: {video_path} (라인 {i+1} -> {video_path})")
+
+        # 영상 가공 (CapCut Style: Time Stretch) - 연장된 duration 사용
+        video_clip = fit_video_to_audio(video_path, duration)
+        final_clips.append(video_clip)
+
+    # 전체 영상 연결
+    log("\n🎞  전체 영상 렌더링 준비 중...")
+    base_video = concatenate_videoclips(final_clips, method="compose")
+
+    # 전체 타임라인 기준으로 자막 생성
+    log("\n📝 자막 생성 중...")
+
+    # 1단계: 모든 chunk 정보 수집
+    all_chunk_infos = []
+    for i, line_info in enumerate(aligned):
+        chunk_infos = chunk_words_with_times(line_info, MAX_LINE_CHARS)
+        for chunk in chunk_infos:
+            all_chunk_infos.append({
+                "text": chunk["text"],
+                "start": chunk["start"],
+                "end": chunk["end"],
+                "line_idx": i
+            })
+
+    # 첫 자막 시작 시각 강제 (영상/오디오 타이밍은 유지하고 자막만 조정)
+    if all_chunk_infos:
+        forced_start = float(max(0.0, min(audio_duration, FORCE_FIRST_SUBTITLE_START)))
+        all_chunk_infos[0]["start"] = min(all_chunk_infos[0]["start"], forced_start)
+
+    # Chunk 타임라인 안전장치: start/end를 오디오 범위로 클램프하고 단조 증가(역행) 방지
+    prev_start = 0.0
+    for c in all_chunk_infos:
+        c["start"] = float(max(0.0, min(audio_duration, c["start"])))
+        c["end"] = float(max(0.0, min(audio_duration, c["end"])))
+        if c["start"] < prev_start + TIMING_EPS:
+            c["start"] = min(audio_duration, prev_start + TIMING_EPS)
+        if c["end"] < c["start"]:
+            c["end"] = c["start"]
+        prev_start = c["start"]
+
+    # 2단계: 각 chunk의 end 시간 보정
+    # - 기본은 다음 chunk 시작까지 붙여 깜빡임을 줄임
+    # - 단, 너무 짧아지면(특히 선두 미매칭 구간) 원래 계산된 end를 유지해 0초 자막을 방지
+    for i in range(len(all_chunk_infos)):
+        chunk = all_chunk_infos[i]
+        chunk_start = chunk["start"]
+        original_end = chunk["end"]
+        min_duration = 0.4
+
+        if i < len(all_chunk_infos) - 1:
+            # 다음 chunk가 있으면 그 시작까지 우선 맞춤
+            next_chunk = all_chunk_infos[i + 1]
+            candidate_end = next_chunk["start"]
+        else:
+            # 마지막 chunk는 오디오 끝까지
+            candidate_end = audio_duration
+
+        # candidate가 너무 짧으면 원래 end를 우선 보존해 0초/초단기 자막을 방지
+        if candidate_end - chunk_start < min_duration:
+            chunk["end"] = max(original_end, chunk_start + min_duration)
+        else:
+            chunk["end"] = candidate_end
+
+        # 최종 안전장치
+        chunk["start"] = max(0.0, min(audio_duration, chunk["start"]))
+        chunk["end"] = max(chunk["start"], min(audio_duration, chunk["end"]))
+
+    # 3단계: 최종 non-overlap 정규화
+    # 앞 chunk가 길어져 겹치면 다음 chunk 시작을 뒤로 밀어 자막 겹침을 제거
+    prev_end = 0.0
+    for chunk in all_chunk_infos:
+        if chunk["start"] < prev_end:
+            chunk["start"] = prev_end
+        if chunk["end"] < chunk["start"]:
+            chunk["end"] = chunk["start"]
+        prev_end = chunk["end"]
+
+    # 4단계: 자막 생성 및 출력
+    all_subtitles = []
+    prev_line_idx = -1
+
+    for i, chunk in enumerate(all_chunk_infos):
+        chunk_start = chunk["start"]
+        chunk_end = chunk["end"]
+        chunk_duration = chunk_end - chunk_start
+
+        # 라인 구분 출력
+        if chunk["line_idx"] != prev_line_idx:
+            log(f"\n   라인 [{chunk['line_idx']+1}]: {aligned[chunk['line_idx']]['text'][:40]}...")
+            prev_line_idx = chunk["line_idx"]
+
+        # 이상 체크 및 pause 정보
+        info_items = []
+        if chunk_duration < 0.4:
+            info_items.append("⚠️ SHORT")
+        if i > 0:
+            gap = chunk_start - all_chunk_infos[i - 1]["end"]
+            if gap > 0.01:
+                info_items.append(f"GAP:{gap:.2f}s")
+            elif gap < -0.01:
+                info_items.append("⚠️ OVERLAP")
+
+        info_str = f" [{', '.join(info_items)}]" if info_items else ""
+
+        sub = create_subtitle(chunk["text"], chunk_duration).set_start(chunk_start)
+        all_subtitles.append(sub)
+        log(f"      '{chunk['text']}' ({chunk_start:.2f}s ~ {chunk_end:.2f}s = {chunk_duration:.2f}s){info_str}")
+
+    log(f"\n총 {len(all_subtitles)}개 자막 생성됨")
+
+    # 자막 합성
+    final_video = CompositeVideoClip([base_video] + all_subtitles)
+
+    # 오디오 합성 (TTS + BGM)
+    log("\n🎵 오디오 합성 중...")
+    if selected_bgm_path:
+        log(f"   ✅ 배경음악: {selected_bgm_path}")
+        log(f"   🔉 BGM 볼륨: {bgm_volume * 100:.0f}%")
+
+        try:
+            # BGM 로드
+            bgm = AudioFileClip(selected_bgm_path)
+
+            # BGM 길이를 영상 길이에 맞춤
+            if bgm.duration < audio_duration:
+                # BGM이 짧으면 루프
+                num_loops = int(audio_duration / bgm.duration) + 1
+                log(f"   🔁 BGM 루프: {num_loops}회 반복")
+                bgm_clips = [bgm] * num_loops
+                from moviepy.editor import concatenate_audioclips
+                bgm = concatenate_audioclips(bgm_clips)
+
+            # 정확한 길이로 자르기
+            bgm = bgm.subclip(0, min(bgm.duration, audio_duration))
+
+            # BGM 볼륨 조정
+            bgm = bgm.volumex(bgm_volume)
+
+            # TTS와 BGM 믹싱
+            final_audio = CompositeAudioClip([original_audio, bgm])
+            final_video = final_video.set_audio(final_audio)
+            log("   ✅ TTS + BGM 믹싱 완료")
+        except Exception as e:
+            log(f"   ⚠️ BGM 추가 실패: {e}")
+            log("   ℹ️ TTS 음성만 사용합니다")
+            final_video = final_video.set_audio(original_audio)
+    else:
+        # BGM 없으면 TTS만 사용
+        log(f"   ℹ️ 배경음악 없음 (폴더: '{bgm_folder}', 폴백 파일: '{bgm_legacy_path}')")
+        log("   ℹ️ TTS 음성만 사용합니다")
+        final_video = final_video.set_audio(original_audio)
+
+    # 길이 정확히 맞추기
+    if final_video.duration > audio_duration:
+        final_video = final_video.subclip(0, audio_duration)
+    elif final_video.duration < audio_duration:
+        log(f"   ⚠️ 영상 길이({final_video.duration:.2f}s)가 오디오({audio_duration:.2f}s)보다 짧습니다.")
+
+    # 내보내기
+    log(f"\n💾 최종 영상 길이: {final_video.duration:.2f}초 (오디오: {audio_duration:.2f}초)")
+    final_video.write_videofile(
+        output_path,
+        fps=30,
+        codec="libx264",
+        audio_codec="aac",
+        threads=4,
+        preset='medium',
+        logger=moviepy_logger,
+    )
+
+    log(f"\n✨ 완성되었습니다! '{output_path}' 확인")
+    return {
+        "output_path": output_path,
+        "selected_bgm_path": selected_bgm_path,
+        "video_files": video_files,
+        "script_lines": script_lines,
+        "audio_duration": audio_duration,
+    }
+
 if __name__ == "__main__":
     print("🚀 쇼츠 영상 자동 생성 시작")
     print("=" * 50)
@@ -755,56 +1197,58 @@ if __name__ == "__main__":
         sys.exit(1)
     
     print(f"✅ 오디오 파일: {AUDIO_PATH}")
-    
+
+    bgm_volume = BGM_VOLUME
+
     # 1-1. 배경음악 설정
-    if os.path.exists(BGM_PATH):
-        print(f"\n🎶 배경음악 발견: {BGM_PATH}")
+    selected_bgm_path = pick_random_bgm_path(BGM_FOLDER, BGM_EXTENSIONS, BGM_LEGACY_PATH)
+    if selected_bgm_path:
+        print(f"\n🎶 배경음악 후보 선택됨: {selected_bgm_path}")
         bgm_choice = input(f"배경음악을 추가하시겠습니까? (y/n, 기본값: y): ").strip().lower()
-        
+
         if bgm_choice == 'n':
-            BGM_PATH = None
+            selected_bgm_path = None
             print("   ℹ️ 배경음악 없이 진행합니다")
         else:
-            volume_input = input(f"BGM 볼륨 설정 (0.0~1.0, 기본값: {BGM_VOLUME}): ").strip()
+            volume_input = input(f"BGM 볼륨 설정 (0.0~1.0, 기본값: {bgm_volume}): ").strip()
             if volume_input:
                 try:
-                    BGM_VOLUME = float(volume_input)
-                    BGM_VOLUME = max(0.0, min(1.0, BGM_VOLUME))  # 0~1 범위로 제한
-                    print(f"   ✅ BGM 볼륨: {BGM_VOLUME * 100:.0f}%")
+                    bgm_volume = float(volume_input)
+                    bgm_volume = max(0.0, min(1.0, bgm_volume))  # 0~1 범위로 제한
+                    print(f"   ✅ BGM 볼륨: {bgm_volume * 100:.0f}%")
                 except ValueError:
-                    print(f"   ⚠️ 잘못된 입력. 기본값({BGM_VOLUME})을 사용합니다")
+                    print(f"   ⚠️ 잘못된 입력. 기본값({bgm_volume})을 사용합니다")
             else:
-                print(f"   ✅ BGM 볼륨: {BGM_VOLUME * 100:.0f}% (기본값)")
+                print(f"   ✅ BGM 볼륨: {bgm_volume * 100:.0f}% (기본값)")
     else:
-        print(f"\n🎶 배경음악 파일 없음 ({BGM_PATH})")
+        print(f"\n🎶 배경음악 파일 없음 (폴더: '{BGM_FOLDER}', 폴백: '{BGM_LEGACY_PATH}')")
         print("   ℹ️ TTS 음성만 사용합니다")
-        BGM_PATH = None
-    
+
     # 2. 대본 입력
     USER_SCRIPT = input_multiline_script()
-    
+
     if not USER_SCRIPT:
         print("\n⛔️ 오류: 대본이 입력되지 않았습니다!")
         sys.exit(1)
-    
+
     print(f"\n✅ {len(USER_SCRIPT)}개 라인 입력 완료")
     for i, line in enumerate(USER_SCRIPT, 1):
         print(f"   [{i}] {line[:50]}{'...' if len(line) > 50 else ''}")
-    
+
     # 3. 비디오 파일 로드
     print(f"\n📂 '{VIDEO_FOLDER}' 폴더에서 비디오 파일 검색 중...")
     VIDEO_FILES = load_video_files(VIDEO_FOLDER)
-    
+
     if not VIDEO_FILES:
         print("\n⛔️ 오류: 비디오 파일을 찾을 수 없습니다!")
         print(f"   '{VIDEO_FOLDER}' 폴더에 1.mp4, 2.mp4, 3.mp4... 형식으로 비디오 파일을 넣어주세요.")
         sys.exit(1)
-    
+
     print(f"\n✅ {len(VIDEO_FILES)}개 비디오 파일 발견:")
     for i, video_file in enumerate(VIDEO_FILES, 1):
         filename = os.path.basename(video_file)
         print(f"   [{i}] {filename}")
-    
+
     # 4. 대본과 비디오 수 확인
     if len(USER_SCRIPT) != len(VIDEO_FILES):
         print(f"\n⚠️ 경고: 대본 수({len(USER_SCRIPT)})와 영상 수({len(VIDEO_FILES)})가 일치하지 않습니다!")
@@ -814,280 +1258,36 @@ if __name__ == "__main__":
             print(f"   영상이 {len(VIDEO_FILES) - len(USER_SCRIPT)}개 초과입니다. 일부 영상은 사용되지 않습니다.")
     else:
         print(f"\n✅ 대본과 영상 수가 일치합니다!")
-    
+
     # 5. 시작 확인
     print("\n" + "=" * 50)
     print("📋 설정 요약:")
     print(f"   🎵 오디오: {AUDIO_PATH}")
-    if BGM_PATH and os.path.exists(BGM_PATH):
-        print(f"   🎶 배경음악: {BGM_PATH} (볼륨: {BGM_VOLUME * 100:.0f}%)")
+    if selected_bgm_path:
+        print(f"   🎶 배경음악: {selected_bgm_path} (볼륨: {bgm_volume * 100:.0f}%)")
     else:
-        print(f"   🎶 배경음악: 없음")
+        print("   🎶 배경음악: 없음")
     print(f"   📝 대본: {len(USER_SCRIPT)}줄")
     print(f"   🎬 영상: {len(VIDEO_FILES)}개")
     print("=" * 50)
-    
+
     response = input("\n영상 생성을 시작하시겠습니까? (y/n): ").strip().lower()
     if response != 'y':
         print("작업이 취소되었습니다.")
         sys.exit(0)
-    
-    print("\n🎬 영상 생성 시작...")
 
-    # 1. Whisper로 오디오 분석 (시간 정보 획득)
-    # User Script가 있으므로, Whisper는 '시간(Timestamp)' 추출용으로만 사용합니다.
-    model = whisper.load_model("base")
     try:
-        result = model.transcribe(AUDIO_PATH, language='ko', word_timestamps=True)
-    except TypeError:
-        result = model.transcribe(AUDIO_PATH, language='ko')
-    segments = result['segments']
-    whisper_words = extract_whisper_words(segments)
-    
-    final_clips = []
-    original_audio = AudioFileClip(AUDIO_PATH)
-    audio_duration = original_audio.duration
-    
-    print(f"\n📊 분석 결과:")
-    print(f"   📋 대본 라인 수: {len(USER_SCRIPT)}")
-    print(f"   🎙 Whisper 인식 문장 수: {len(segments)}")
-    print(f"   🔤 Whisper 단어 수: {len(whisper_words)}")
-    print(f"   🎬 영상 파일 수: {len(VIDEO_FILES)}")
-    
-    if len(whisper_words) == 0:
-        print("⚠️ Whisper에서 단어 타임스탬프를 추출하지 못했습니다. 문장 단위 타이밍을 사용합니다.")
-    else:
-        print("\n🔍 Whisper 세그먼트 상세:")
-        for i, seg in enumerate(segments):
-            print(f"   [{i+1}] {seg['start']:.2f}~{seg['end']:.2f}s: {seg['text']}")
-    
-    loop_count = len(USER_SCRIPT)
-    aligned = align_script_lines(USER_SCRIPT, whisper_words)
-    aligned = resolve_line_timings(aligned, segments, audio_duration)
-    
-    # 디버그: 타이밍 확인
-    print("\n⏰ 라인별 타이밍 정보 (word 매칭 후):")
-    for i, info in enumerate(aligned):
-        if info["start"] is not None and info["end"] is not None:
-            duration = info["end"] - info["start"]
-            start_str = f"{info['start']:.2f}"
-            end_str = f"{info['end']:.2f}"
-        else:
-            duration = 0
-            start_str = "N/A"
-            end_str = "N/A"
-        matched = info.get("matched_words", 0)
-        total = len(info["word_times"])
-        conf = float(info.get("confidence", 0.0) or 0.0)
-        avg_sim = float(info.get("avg_sim", 0.0) or 0.0)
-        print(f"   [{i+1}] {duration:.2f}초 ({start_str} ~ {end_str}): {info['text'][:40]}... [매칭: {matched}/{total}, conf:{conf:.2f}, sim:{avg_sim:.2f}]")
-    
-    # 전체 비디오 클립 생성 - 다음 라인 시작 직전까지 연장 (자막과 동일한 로직)
-    print("\n🎬 영상 클립 타이밍 조정:")
-    
-    # 1단계: 각 라인의 실제 영상 duration 계산 (다음 라인 시작 직전까지)
-    video_durations = []
-    for i in range(loop_count):
-        start_t = aligned[i]["start"]
-        
-        if i < loop_count - 1:
-            # 다음 라인 시작 직전까지 (간격 없음)
-            next_start = aligned[i + 1]["start"]
-            end_t = next_start
-        else:
-            # 마지막 라인은 오디오 끝까지
-            end_t = audio_duration
-        
-        duration = end_t - start_t
-        video_durations.append({
-            "index": i,
-            "start": start_t,
-            "end": end_t,
-            "duration": duration,
-            "original_end": aligned[i]["end"]
-        })
-        
-        gap_info = ""
-        if i < loop_count - 1:
-            gap = aligned[i + 1]["start"] - aligned[i]["end"]
-            if gap > 0.1:
-                gap_info = f" (+{gap:.2f}초 연장)"
-        
-        print(f"   라인 [{i+1}]: {start_t:.2f}s ~ {end_t:.2f}s = {duration:.2f}초{gap_info}")
-    
-    # 2단계: 영상 클립 생성
-    for i in range(loop_count):
-        line_info = aligned[i]
-        text_line = line_info["text"]
-        vd = video_durations[i]
-        start_t = vd["start"]
-        end_t = vd["end"]
-        duration = vd["duration"]
-
-        # 영상 파일 1:1 매핑 (라인 1 -> 1.mp4, 라인 2 -> 2.mp4, ...)
-        if i < len(VIDEO_FILES):
-            video_path = VIDEO_FILES[i]
-        else:
-            # 영상이 부족한 경우 마지막 영상 재사용
-            video_path = VIDEO_FILES[-1]
-            print(f"   ⚠️ [{i+1}번 라인] 영상이 부족하여 {VIDEO_FILES[-1]}을(를) 재사용합니다.")
-        
-        print(f"\n[{i+1}/{loop_count}] Scene 생성 중...")
-        print(f"   📝 대사: {text_line}")
-        print(f"   ⏱ 영상 시간: {duration:.2f}초 ({start_t:.2f} ~ {end_t:.2f})")
-        print(f"   🎙 TTS 시간: {vd['original_end'] - start_t:.2f}초 ({start_t:.2f} ~ {vd['original_end']:.2f})")
-        print(f"   📼 영상: {video_path} (라인 {i+1} -> {video_path})")
-        
-        # 영상 가공 (CapCut Style: Time Stretch) - 연장된 duration 사용
-        video_clip = fit_video_to_audio(video_path, duration)
-        final_clips.append(video_clip)
-    
-    # 전체 영상 연결
-    print("\n🎞  전체 영상 렌더링 준비 중...")
-    base_video = concatenate_videoclips(final_clips, method="compose")
-    
-    # 전체 타임라인 기준으로 자막 생성
-    print("\n📝 자막 생성 중...")
-    
-    # 1단계: 모든 chunk 정보 수집
-    all_chunk_infos = []
-    for i, line_info in enumerate(aligned):
-        chunk_infos = chunk_words_with_times(line_info, MAX_LINE_CHARS)
-        for chunk in chunk_infos:
-            all_chunk_infos.append({
-                "text": chunk["text"],
-                "start": chunk["start"],
-                "end": chunk["end"],
-                "line_idx": i
-            })
-
-    # Chunk 타임라인 안전장치: start/end를 오디오 범위로 클램프하고 단조 증가(역행) 방지
-    prev_start = 0.0
-    for c in all_chunk_infos:
-        c["start"] = float(max(0.0, min(audio_duration, c["start"])))
-        c["end"] = float(max(0.0, min(audio_duration, c["end"])))
-        if c["start"] < prev_start + TIMING_EPS:
-            c["start"] = min(audio_duration, prev_start + TIMING_EPS)
-        if c["end"] < c["start"]:
-            c["end"] = c["start"]
-        prev_start = c["start"]
-    
-    # 2단계: 각 chunk의 end 시간을 다음 chunk 시작 직전까지 연장 (간격 0초)
-    for i in range(len(all_chunk_infos)):
-        chunk = all_chunk_infos[i]
-        
-        if i < len(all_chunk_infos) - 1:
-            # 다음 chunk가 있으면 그 시작 직전까지 연장 (간격 없음)
-            next_chunk = all_chunk_infos[i + 1]
-            chunk["end"] = next_chunk["start"]
-        else:
-            # 마지막 chunk는 오디오 끝까지
-            chunk["end"] = audio_duration
-        
-        # 최소 duration 보장 (0.4초로 완화)
-        min_duration = 0.4
-        if chunk["end"] - chunk["start"] < min_duration:
-            # 다음 chunk 시작 직전까지 연장 (단, 최소 시간 보장)
-            if i < len(all_chunk_infos) - 1:
-                max_end = all_chunk_infos[i + 1]["start"]
-                chunk["end"] = min(chunk["start"] + min_duration, max_end)
-            else:
-                chunk["end"] = min(chunk["start"] + min_duration, audio_duration)
-
-        # 최종 안전장치
-        chunk["start"] = max(0.0, min(audio_duration, chunk["start"]))
-        chunk["end"] = max(chunk["start"], min(audio_duration, chunk["end"]))
-    
-    # 3단계: 자막 생성 및 출력
-    all_subtitles = []
-    prev_line_idx = -1
-    
-    for i, chunk in enumerate(all_chunk_infos):
-        chunk_start = chunk["start"]
-        chunk_end = chunk["end"]
-        chunk_duration = chunk_end - chunk_start
-        
-        # 라인 구분 출력
-        if chunk["line_idx"] != prev_line_idx:
-            print(f"\n   라인 [{chunk['line_idx']+1}]: {aligned[chunk['line_idx']]['text'][:40]}...")
-            prev_line_idx = chunk["line_idx"]
-        
-        # 이상 체크 및 pause 정보
-        info_items = []
-        if chunk_duration < 0.4:
-            info_items.append(f"⚠️ SHORT")
-        if i > 0:
-            gap = chunk_start - all_chunk_infos[i-1]["end"]
-            if gap > 0.01:
-                info_items.append(f"GAP:{gap:.2f}s")
-            elif gap < -0.01:
-                info_items.append(f"⚠️ OVERLAP")
-        
-        info_str = f" [{', '.join(info_items)}]" if info_items else ""
-        
-        sub = create_subtitle(chunk["text"], chunk_duration).set_start(chunk_start)
-        all_subtitles.append(sub)
-        print(f"      '{chunk['text']}' ({chunk_start:.2f}s ~ {chunk_end:.2f}s = {chunk_duration:.2f}s){info_str}")
-    
-    print(f"\n총 {len(all_subtitles)}개 자막 생성됨")
-    
-    # 자막 합성
-    final_video = CompositeVideoClip([base_video] + all_subtitles)
-        
-    # 오디오 합성 (TTS + BGM)
-    print("\n🎵 오디오 합성 중...")
-    
-    # BGM 추가 여부 확인
-    if BGM_PATH and os.path.exists(BGM_PATH):
-        print(f"   ✅ 배경음악: {BGM_PATH}")
-        print(f"   🔉 BGM 볼륨: {BGM_VOLUME * 100:.0f}%")
-        
-        try:
-            # BGM 로드
-            bgm = AudioFileClip(BGM_PATH)
-            
-            # BGM 길이를 영상 길이에 맞춤
-            if bgm.duration < audio_duration:
-                # BGM이 짧으면 루프
-                num_loops = int(audio_duration / bgm.duration) + 1
-                print(f"   🔁 BGM 루프: {num_loops}회 반복")
-                bgm_clips = [bgm] * num_loops
-                from moviepy.editor import concatenate_audioclips
-                bgm = concatenate_audioclips(bgm_clips)
-            
-            # 정확한 길이로 자르기
-            bgm = bgm.subclip(0, min(bgm.duration, audio_duration))
-            
-            # BGM 볼륨 조정
-            bgm = bgm.volumex(BGM_VOLUME)
-            
-            # TTS와 BGM 믹싱
-            final_audio = CompositeAudioClip([original_audio, bgm])
-            final_video = final_video.set_audio(final_audio)
-            print("   ✅ TTS + BGM 믹싱 완료")
-        except Exception as e:
-            print(f"   ⚠️ BGM 추가 실패: {e}")
-            print("   ℹ️ TTS 음성만 사용합니다")
-            final_video = final_video.set_audio(original_audio)
-    else:
-        # BGM 없으면 TTS만 사용
-        print("   ℹ️ 배경음악 없음")
-        print("   ℹ️ TTS 음성만 사용합니다")
-        final_video = final_video.set_audio(original_audio)
-    
-    # 길이 정확히 맞추기
-    if final_video.duration > audio_duration:
-        final_video = final_video.subclip(0, audio_duration)
-    elif final_video.duration < audio_duration:
-        print(f"   ⚠️ 영상 길이({final_video.duration:.2f}s)가 오디오({audio_duration:.2f}s)보다 짧습니다.")
-    
-    # 내보내기
-    print(f"\n💾 최종 영상 길이: {final_video.duration:.2f}초 (오디오: {audio_duration:.2f}초)")
-    final_video.write_videofile("final_shorts_autofit.mp4", 
-                                fps=30, 
-                                codec="libx264", 
-                                audio_codec="aac",
-                                threads=4,
-                                preset='medium')
-    
-    print("\n✨ 완성되었습니다! 'final_shorts_autofit.mp4' 확인")
+        generate_shorts(
+            audio_path=AUDIO_PATH,
+            user_script=USER_SCRIPT,
+            video_folder=VIDEO_FOLDER,
+            selected_bgm_path=selected_bgm_path,
+            bgm_volume=bgm_volume,
+            output_path="final_shorts_autofit.mp4",
+            auto_pick_bgm=False,
+            log_fn=print,
+            moviepy_logger="bar",
+        )
+    except Exception as e:
+        print(f"\n⛔️ 오류: 영상 생성 실패 - {e}")
+        sys.exit(1)
