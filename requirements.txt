@@ -1,0 +1,5 @@
+streamlit
+numpy
+moviepy<2
+openai-whisper
+Pillow
